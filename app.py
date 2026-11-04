@@ -617,12 +617,6 @@ with tab_ai:
     else:
         stats_rows = compute_attribute_stats(fdf)
 
-        with st.expander("Stats table this assistant is allowed to cite", expanded=False):
-            st.dataframe(pd.DataFrame(stats_rows), width="stretch", hide_index=True)
-
-        if "brief_messages" not in st.session_state:
-            st.session_state.brief_messages = []
-
         for msg in st.session_state.brief_messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
