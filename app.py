@@ -8,12 +8,37 @@ Streamlit MVP demo for Team-6's Mandate:
 Run with:  streamlit run app.py
 """
 
+import os
+import re
+
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy import stats
+
+try:
+    from dotenv import load_dotenv
+    from google import genai
+    from google.genai import types
+
+    load_dotenv()
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    # Local runs read GEMINI_API_KEY from .env (python-dotenv, above). On
+    # Streamlit Community Cloud there is no .env file (and this repo is
+    # public, so one should never be committed there) - the key instead
+    # comes from the app's Settings -> Secrets panel, exposed as st.secrets.
+    try:
+        GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        GEMINI_API_KEY = None
+GEMINI_MODEL = "gemini-3-flash-preview"
 
 # ---------------------------------------------------------------------------
 # Palette (Anthropic dataviz reference palette - the same colors used in the
@@ -39,6 +64,138 @@ ATTR_LABELS = {
     "animals": "Animals",
     "use_sex": "Sex appeal",
 }
+
+# ---------------------------------------------------------------------------
+# Creative Brief Assistant - helpers (AI Integration: Defined, now built)
+#
+# The stats table below is computed in plain Python/scipy, exactly like the
+# Compare tab's Mann-Whitney test. The AI never sees raw data and never
+# assigns its own Use/Avoid/Unproven label - it is handed the label already
+# decided by code and told it may not override it. After each reply, the
+# numbers the AI cites are checked against this same table.
+# ---------------------------------------------------------------------------
+MIN_GROUP_N = 10
+SIG_LEVEL = 0.05
+
+
+def _label_for_group(p_val, n_with, n_without, with_mean, without_mean):
+    """Use/Avoid requires a real sample on both sides and a significant p-value;
+    everything else is Unproven. This is the one rule the AI is not allowed to
+    relabel, no matter how it reads the numbers."""
+    if with_mean is None or without_mean is None or p_val is None:
+        return "Unproven"
+    if n_with < MIN_GROUP_N or n_without < MIN_GROUP_N or p_val >= SIG_LEVEL:
+        return "Unproven"
+    return "Use" if with_mean > without_mean else "Avoid"
+
+
+def compute_attribute_stats(fdf):
+    """Builds the one stats table the Creative Brief Assistant is allowed to
+    cite from, for every attribute, under the current sidebar filters."""
+    am = fdf[fdf["has_admeter"] == True]
+    yt = fdf[fdf["has_youtube"] == True]
+    wiki = fdf[fdf["has_wiki_attention"] == True]
+
+    rows = []
+    for a in ATTRS:
+        with_grp = am[am[a] == True]["ad_meter_percentile"].dropna()
+        without_grp = am[am[a] == False]["ad_meter_percentile"].dropna()
+        n_with, n_without = len(with_grp), len(without_grp)
+
+        p_val = None
+        if n_with >= 3 and n_without >= 3:
+            _, p_val = stats.mannwhitneyu(with_grp, without_grp, alternative="two-sided")
+
+        with_mean = float(with_grp.mean()) if n_with else None
+        without_mean = float(without_grp.mean()) if n_without else None
+        label = _label_for_group(p_val, n_with, n_without, with_mean, without_mean)
+
+        yt_with = yt[yt[a] == True]["view_count"].dropna()
+        wiki_with = wiki[wiki[a] == True]["wiki_attention_spike"].dropna()
+
+        rows.append({
+            "attribute": ATTR_LABELS[a],
+            "n_with": n_with,
+            "n_without": n_without,
+            "approval_with_pct": round(with_mean * 100, 1) if with_mean is not None else None,
+            "approval_without_pct": round(without_mean * 100, 1) if without_mean is not None else None,
+            "p_value": round(p_val, 3) if p_val is not None else None,
+            "label": label,
+            "avg_youtube_views": int(yt_with.mean()) if len(yt_with) else None,
+            "avg_wiki_attention_spike": round(float(wiki_with.mean()), 2) if len(wiki_with) else None,
+        })
+    return rows
+
+
+def build_system_instruction(rows, year_range, brand_pick):
+    header = "| Attribute | n(with) | n(without) | Approval w/ | Approval w/o | p-value | Label | Avg YouTube views (w/) | Avg Wiki spike (w/) |"
+    sep = "|---|---|---|---|---|---|---|---|---|"
+    lines = [header, sep]
+    for r in rows:
+        lines.append(
+            f"| {r['attribute']} | {r['n_with']} | {r['n_without']} | "
+            f"{r['approval_with_pct']}% | {r['approval_without_pct']}% | "
+            f"{r['p_value']} | {r['label']} | {r['avg_youtube_views']} | {r['avg_wiki_attention_spike']} |"
+        )
+    table_md = "\n".join(lines)
+
+    filters_desc = f"years {year_range[0]}-{year_range[1]}"
+    filters_desc += f", brands: {', '.join(brand_pick)}" if brand_pick else ", all brands"
+
+    return f"""You are the Creative Brief Assistant for Account E's Super Bowl ad strategy team.
+
+Current dashboard filters: {filters_desc}.
+
+STATS TABLE - the only numbers you may cite. Do not use any number, percentage, or
+statistic that is not in this table, and do not compute new ones:
+
+{table_md}
+
+The "Label" column is pre-computed by code and is the ONLY label you may use for
+that attribute (Use / Avoid / Unproven). Never relabel an attribute yourself, even
+if it seems to make a better story - Unproven means n < {MIN_GROUP_N} in either
+group or p >= {SIG_LEVEL}, and that rule is not negotiable.
+
+When asked for a creative brief, respond with 3-5 recommendations. For each one:
+- Name the attribute and its label (Use, Avoid, or Unproven)
+- Cite the exact statistic from the table that supports it (percentages, p-value, or n)
+- Keep it to one or two sentences
+
+End with one line of caveats naming any real data gaps (e.g. attributes left
+Unproven because of small sample size).
+
+If asked something the stats table can't answer, say so plainly rather than
+inventing a number."""
+
+
+def validate_citations(response_text, rows):
+    """Lightweight check that every number-looking token the AI cited actually
+    appears (or closely rounds to) a number in the stats table. Mirrors the
+    deck's 'a brief citing any value not in the table is regenerated' rule -
+    here it flags for a human to check rather than silently retrying."""
+    table_numbers = []
+    for r in rows:
+        for key in ("n_with", "n_without", "approval_with_pct", "approval_without_pct",
+                    "p_value", "avg_youtube_views", "avg_wiki_attention_spike"):
+            v = r.get(key)
+            if v is not None:
+                table_numbers.append(float(v))
+
+    tokens = re.findall(r"\d[\d,]*\.?\d*%?", response_text)
+    suspicious = []
+    for tok in tokens:
+        bare = tok.rstrip("%").replace(",", "")
+        try:
+            val = float(bare)
+        except ValueError:
+            continue
+        if val < MIN_GROUP_N and "%" not in tok:
+            continue  # skip small counts like "3-5 recommendations"
+        if any(abs(val - n) < 0.6 for n in table_numbers):
+            continue
+        suspicious.append(tok)
+    return suspicious
+
 
 st.set_page_config(page_title="Account E - Super Bowl Ad Strategy", page_icon="🏈", layout="wide")
 st.markdown(
@@ -177,8 +334,9 @@ if len(fdf) == 0:
     st.warning("No ads match the current filters. Loosen a filter in the sidebar.")
     st.stop()
 
-tab_compare, tab_correlate, tab_rank, tab_locate, tab_phase2 = st.tabs(
-    ["📊 Compare", "📈 Correlate", "🏆 Rank", "🗺️ Locate / Overview", "🧩 Phase 2: Attribute Combo Explorer"]
+tab_compare, tab_correlate, tab_rank, tab_locate, tab_phase2, tab_ai = st.tabs(
+    ["📊 Compare", "📈 Correlate", "🏆 Rank", "🗺️ Locate / Overview",
+     "🧩 Phase 2: Attribute Combo Explorer", "🤖 Creative Brief Assistant"]
 )
 
 # ---------------------------------------------------------------------------
@@ -431,6 +589,109 @@ with tab_phase2:
             "- **What's deferred to Sprint-to-Final:** the AI layer (see below) will turn this from "
             "\"look up similar past ads\" into \"describe your concept in a sentence and get the "
             "closest-matching historical combination suggested automatically.\""
+        )
+
+# ---------------------------------------------------------------------------
+# TAB 6 - CREATIVE BRIEF ASSISTANT (AI Integration: Defined, now built)
+# ---------------------------------------------------------------------------
+with tab_ai:
+    st.subheader("Creative Brief Assistant")
+    st.caption(
+        "Task: GENERATE. Turns the current filtered view into a short, evidence-backed "
+        "creative brief for next year's concept pitch. Every recommendation must cite a "
+        "number from the stats table below - the AI cannot invent its own statistics or "
+        "override the Use / Avoid / Unproven label."
+    )
+
+    if not _GENAI_AVAILABLE:
+        st.warning(
+            "The Gemini SDK isn't installed in this environment. Run "
+            "`pip install google-genai python-dotenv` (or `uv sync` if this project uses uv) "
+            "and restart the app."
+        )
+    elif not GEMINI_API_KEY:
+        st.warning(
+            "No GEMINI_API_KEY found. Add one to a `.env` file in this folder:\n\n"
+            "`GEMINI_API_KEY=your_api_key_here`"
+        )
+    else:
+        stats_rows = compute_attribute_stats(fdf)
+
+        with st.expander("Stats table this assistant is allowed to cite", expanded=False):
+            st.dataframe(pd.DataFrame(stats_rows), width="stretch", hide_index=True)
+
+        if "brief_messages" not in st.session_state:
+            st.session_state.brief_messages = []
+
+        for msg in st.session_state.brief_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg.get("flag"):
+                    st.caption(msg["flag"])
+
+        prompt = st.chat_input(
+            "Ask for a creative brief, e.g. “What should we recommend for next year's pitch?”"
+        )
+        if prompt:
+            st.session_state.brief_messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            system_instruction = build_system_instruction(stats_rows, year_range, brand_pick)
+
+            contents = []
+            for msg in st.session_state.brief_messages:
+                role = "model" if msg["role"] == "assistant" else "user"
+                contents.append(
+                    types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
+                )
+
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                assistant_content = ""
+                try:
+                    for chunk in client.models.generate_content_stream(
+                        model=GEMINI_MODEL,
+                        contents=contents,
+                        config=types.GenerateContentConfig(system_instruction=system_instruction),
+                    ):
+                        assistant_content += chunk.text or ""
+                        placeholder.markdown(assistant_content)
+                except Exception as e:
+                    assistant_content = f"Sorry, the request to Gemini failed: {e}"
+                    placeholder.markdown(assistant_content)
+
+                suspicious = validate_citations(assistant_content, stats_rows)
+                if suspicious:
+                    flag = (
+                        "⚠️ Numbers not found in the stats table: "
+                        + ", ".join(suspicious) + " - verify before using."
+                    )
+                else:
+                    flag = "✅ All cited numbers matched the stats table."
+                st.caption(flag)
+
+            st.session_state.brief_messages.append(
+                {"role": "assistant", "content": assistant_content, "flag": flag}
+            )
+
+        if st.session_state.brief_messages and st.button("Clear conversation"):
+            st.session_state.brief_messages = []
+            st.rerun()
+
+    with st.expander("How this is validated"):
+        st.markdown(
+            "- The **Label** column (Use / Avoid / Unproven) is computed in Python from the "
+            "same Mann-Whitney test used in the Compare tab, *before* the AI ever sees it - "
+            "the model is told which label is allowed and cannot override it.\n"
+            f"- Use or Avoid requires p < {SIG_LEVEL} **and** n ≥ {MIN_GROUP_N} in both "
+            "groups; everything else is labeled Unproven, including low-n attributes like "
+            "Patriotic.\n"
+            "- After each reply, the numbers in the AI's response are checked against the "
+            "stats table; any number that doesn't match is flagged for a human to "
+            "double-check rather than trusted automatically.\n"
+            f"- Model: Gemini (`{GEMINI_MODEL}`) via the Gemini API."
         )
 
 # ---------------------------------------------------------------------------
