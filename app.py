@@ -158,7 +158,9 @@ group or p >= {SIG_LEVEL}, and that rule is not negotiable.
 
 When asked for a creative brief, respond with 3-5 recommendations. For each one:
 - Name the attribute and its label (Use, Avoid, or Unproven)
-- Cite the exact statistic from the table that supports it (percentages, p-value, or n)
+        - Cite the exact statistic from the table that supports it (approval percentages and/or
+          sample size n). Do NOT mention the p-value number itself in your response - use it only
+          internally to understand why something is labeled the way it is.
 - Keep it to one or two sentences
 
 End with one line of caveats naming any real data gaps (e.g. attributes left
