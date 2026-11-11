@@ -38,7 +38,32 @@ if not GEMINI_API_KEY:
         GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
     except Exception:
         GEMINI_API_KEY = None
-GEMINI_MODEL = "gemini-3-flash-preview"
+# "gemini-3-flash-preview" was retired (404 NOT_FOUND). To pin a different model
+# without editing code, set GEMINI_MODEL in .env or in Streamlit Secrets. If the
+# chosen model returns 404, the app automatically tries the fallbacks below.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.6-flash"
+GEMINI_FALLBACKS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+
+
+def stream_gemini(client, contents, system_instruction):
+    """Streams a reply, moving to the next model only if one is not found (404)."""
+    last_err = None
+    for model_name in [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]:
+        started = False
+        try:
+            for chunk in client.models.generate_content_stream(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(system_instruction=system_instruction),
+            ):
+                started = True
+                yield chunk
+            return
+        except Exception as e:
+            if started or not ("404" in str(e) or "NOT_FOUND" in str(e)):
+                raise
+            last_err = e
+    raise last_err
 
 # ---------------------------------------------------------------------------
 # Palette (Anthropic dataviz reference palette - the same colors used in the
@@ -578,11 +603,7 @@ with st.sidebar:
                     _failed = False
                     try:
                         _client = genai.Client(api_key=GEMINI_API_KEY)
-                        for _chunk in _client.models.generate_content_stream(
-                            model=GEMINI_MODEL,
-                            contents=_contents,
-                            config=types.GenerateContentConfig(system_instruction=build_home_instruction(_ctx)),
-                        ):
+                        for _chunk in stream_gemini(_client, _contents, build_home_instruction(_ctx)):
                             _raw += _chunk.text or ""
                             _ph.markdown(split_tabs_marker(_raw)[0])
                     except Exception as _e:
@@ -953,11 +974,7 @@ with tab_ai:
                 placeholder = st.empty()
                 assistant_content = ""
                 try:
-                    for chunk in client.models.generate_content_stream(
-                        model=GEMINI_MODEL,
-                        contents=contents,
-                        config=types.GenerateContentConfig(system_instruction=system_instruction),
-                    ):
+                    for chunk in stream_gemini(client, contents, system_instruction):
                         assistant_content += chunk.text or ""
                         placeholder.markdown(assistant_content)
                 except Exception as e:
