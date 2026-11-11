@@ -176,7 +176,6 @@ gaps (e.g. attributes left Unproven because of small sample size) - but don't
 force this onto a one-line answer where it doesn't fit."""
 
 
-
 def validate_citations(response_text, rows):
     """Lightweight check that every number-looking token the AI cited actually
     appears (or closely rounds to) a number in the stats table. Mirrors the
@@ -189,21 +188,214 @@ def validate_citations(response_text, rows):
             v = r.get(key)
             if v is not None:
                 table_numbers.append(float(v))
+    return _flag_numbers(response_text, table_numbers)
 
+
+def _flag_numbers(response_text, allowed_numbers):
+    """Returns the number-looking tokens in the response that don't match any
+    allowed number. Years (e.g. 2000, 2025) and tiny counts are ignored - they
+    are filter bounds / list positions, not statistics."""
     tokens = re.findall(r"\d[\d,]*\.?\d*%?", response_text)
     suspicious = []
     for tok in tokens:
-        bare = tok.rstrip("%").replace(",", "")
+        bare = tok.rstrip("%").replace(",", "").rstrip(".")
         try:
             val = float(bare)
         except ValueError:
             continue
+        if "%" not in tok and 1900 <= val <= 2100 and val == int(val):
+            continue  # a year, not a statistic
         if val < MIN_GROUP_N and "%" not in tok:
             continue  # skip small counts like "3-5 recommendations"
-        if any(abs(val - n) < 0.6 for n in table_numbers):
+        if any(abs(val - n) < 0.6 or (n >= 1000 and abs(val - n) / n < 0.005)
+               for n in allowed_numbers):
             continue
         suspicious.append(tok)
     return suspicious
+
+
+# ---------------------------------------------------------------------------
+# Homepage assistant ("Ask the Dashboard") - helpers
+#
+# One chat box in the sidebar that can answer questions about every page. It is
+# handed (1) a plain-language guide to each page and (2) the live numbers for the
+# current sidebar filters. Same rules as the Creative Brief Assistant: the model
+# may only cite numbers from that context, and every number in its reply is
+# checked against it afterwards.
+# ---------------------------------------------------------------------------
+PAGE_GUIDE = """PAGE GUIDE (what each part of the dashboard is):
+
+SIDEBAR FILTERS + KEY METRICS: Year range, brand, "creative attributes present" and
+"data source required" narrow every page except Phase 2 (which always uses the full
+history). The four Key Metrics cards count ads in the current view and how many have
+YouTube stats, an Ad Meter score, and Wikipedia attention data.
+
+COMPARE tab: "Does a creative attribute change live-audience approval?" A dumbbell chart:
+two dots joined by a line. One dot is the average Ad Meter approval of ads WITH the chosen
+attribute, the other is ads WITHOUT it; the line between them is the gap, so a longer line
+means a bigger effect. The user picks the attribute from a dropdown. Below the chart it
+shows how many ads are in each group and a Mann-Whitney significance check. A dumbbell was
+chosen over single bars and box plots because it puts the gap itself on the page.
+
+CORRELATE tab: "Does a well-liked ad travel further online?" A scatter plot, one dot per ad:
+x = approval percentile, y = YouTube views (log scale, because views span hundreds to
+hundreds of millions). Spearman rho summarises it: near 0 means approval and views are not
+related, toward +1 means better-liked ads also get more views.
+
+RANK tab: "Which ads got the biggest online attention spike?" Horizontal bars of the ads with
+the largest Wikipedia pageview spikes (a spike of 10 means 10x normal pageviews), sorted so the
+biggest are on top. A slider picks how many ads to show (5 to 20).
+
+LOCATE / OVERVIEW tab: "Which years does each data source cover?" Grouped bars per year: how
+many ads have YouTube, Ad Meter, and Wikipedia data. Its point is to make coverage gaps visible.
+
+PHASE 2 - ATTRIBUTE COMBO EXPLORER tab: the user builds a concept by picking several creative
+attributes; it finds past ads with exactly that combination and shows how many match, their
+average approval and average YouTube views versus the overall averages, and lists the matching
+ads. Few matches means the result is only a directional signal.
+
+CREATIVE BRIEF ASSISTANT tab: a chat that writes short, evidence-backed creative briefs for next
+year's pitch, using the Use / Avoid / Unproven labels.
+
+LABELS: Use = approval is significantly higher with the attribute; Avoid = significantly lower;
+Unproven = not enough evidence (too few ads, or the difference could be chance). The label is
+computed by code and must never be changed.
+"""
+
+
+def build_page_context(fdf, df, stats_rows, year_range, brand_pick, active_attrs, active_sources):
+    """Live numbers for the current sidebar filters, as plain text the assistant may cite."""
+    from itertools import combinations
+
+    out = ["LIVE DATA FOR THE CURRENT VIEW (the only numbers you may cite):", ""]
+    filt = f"years {year_range[0]}-{year_range[1]}"
+    filt += f"; brands: {', '.join(brand_pick)}" if brand_pick else "; all brands"
+    if active_attrs:
+        filt += f"; only ads with: {', '.join(active_attrs)}"
+    if active_sources:
+        filt += f"; only ads with: {', '.join(active_sources)}"
+    out.append(f"Filters: {filt}.")
+    out.append(
+        f"Key metrics: {len(fdf)} ads in view; {int(fdf['has_youtube'].sum())} with YouTube stats; "
+        f"{int(fdf['has_admeter'].sum())} with Ad Meter score; "
+        f"{int(fdf['has_wiki_attention'].sum())} with Wikipedia attention data."
+    )
+
+    # Compare (and Creative Brief)
+    out += ["", "COMPARE / CREATIVE BRIEF - approval with vs. without each attribute:",
+            "| Attribute | n(with) | n(without) | Approval w/ | Approval w/o | p-value | Label | Avg YouTube views (w/) | Avg Wiki spike (w/) |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    for r in stats_rows:
+        ayv = f"{r['avg_youtube_views']:,}" if r["avg_youtube_views"] is not None else "n/a"
+        out.append(
+            f"| {r['attribute']} | {r['n_with']} | {r['n_without']} | "
+            f"{r['approval_with_pct']}% | {r['approval_without_pct']}% | {r['p_value']} | "
+            f"{r['label']} | {ayv} | {r['avg_wiki_attention_spike']} |"
+        )
+
+    # Correlate
+    both = fdf[(fdf["has_youtube"] == True) & (fdf["has_admeter"] == True)].dropna(
+        subset=["ad_meter_percentile", "view_count"])
+    out += ["", "CORRELATE - approval percentile vs. YouTube views:"]
+    if len(both) >= 5:
+        rho, _ = stats.spearmanr(both["ad_meter_percentile"], both["view_count"])
+        out.append(f"Spearman rho = {rho:.2f} across {len(both)} ads that have both an Ad Meter score and YouTube views.")
+    else:
+        out.append("Not enough ads with both an Ad Meter score and YouTube views in this view.")
+
+    # Rank
+    wk = fdf[fdf["has_wiki_attention"] == True].copy()
+    wk["label"] = wk["brand"] + " " + wk["year"].astype(str)
+    wk = wk.drop_duplicates(subset=["brand", "year"])
+    top = wk.nlargest(10, "wiki_attention_spike")
+    out += ["", "RANK - ads with the biggest Wikipedia attention spike (x normal pageviews), top 10:"]
+    if len(top):
+        for _, rw in top.iterrows():
+            out.append(f"- {rw['label']}: {round(float(rw['wiki_attention_spike']), 2)}x")
+    else:
+        out.append("No ads with Wikipedia attention data in this view.")
+
+    # Locate
+    out += ["", "LOCATE / OVERVIEW - number of ads with each data source, by year:"]
+    for s, lbl in (("has_youtube", "YouTube"), ("has_admeter", "Ad Meter"), ("has_wiki_attention", "Wikipedia")):
+        yrs = sorted(fdf.loc[fdf[s] == True, "year"].unique())
+        if len(yrs):
+            out.append(f"{lbl}: {int(fdf[s].sum())} ads in total, covering years {int(yrs[0])} to {int(yrs[-1])}.")
+        else:
+            out.append(f"{lbl}: no ads in this view.")
+    for y in sorted(fdf["year"].unique()):
+        sub = fdf[fdf["year"] == y]
+        out.append(
+            f"- {int(y)}: YouTube {int(sub['has_youtube'].sum())}, Ad Meter {int(sub['has_admeter'].sum())}, "
+            f"Wikipedia {int(sub['has_wiki_attention'].sum())}"
+        )
+
+    # Phase 2 (always full history, ignores sidebar filters)
+    ov_app = df.loc[df["has_admeter"] == True, "ad_meter_percentile"].mean()
+    ov_views = df.loc[df["has_youtube"] == True, "view_count"].mean()
+    out += ["", "PHASE 2 - ATTRIBUTE COMBO EXPLORER (full history, ignores sidebar filters):",
+            f"Overall average approval {ov_app * 100:.1f}%; overall average YouTube views {int(ov_views):,}.",
+            "Most common 2-attribute combinations (5+ ads):"]
+    pairs = []
+    for a, b in combinations(ATTRS, 2):
+        sub = df[(df[a] == True) & (df[b] == True)]
+        if len(sub) >= 5:
+            ap = sub.loc[sub["has_admeter"] == True, "ad_meter_percentile"]
+            vw = sub.loc[sub["has_youtube"] == True, "view_count"]
+            pairs.append((len(sub), a, b, ap, vw))
+    for n, a, b, ap, vw in sorted(pairs, key=lambda t: -t[0])[:12]:
+        appr = f"{ap.mean() * 100:.1f}%" if len(ap) else "n/a"
+        views = f"{int(vw.mean()):,}" if len(vw) else "n/a"
+        out.append(f"- {ATTR_LABELS[a]} + {ATTR_LABELS[b]}: {n} ads; avg approval {appr}; avg YouTube views {views}")
+    return "\n".join(out)
+
+
+def build_home_instruction(context_text):
+    return f"""You are the dashboard guide for Account E's Super Bowl ad strategy dashboard. You
+answer questions about ANY page of it: Compare, Correlate, Rank, Locate / Overview, Phase 2, and
+the Creative Brief Assistant - what a chart shows, how to read it, why it was chosen, and what the
+current numbers say.
+
+{PAGE_GUIDE}
+{context_text}
+
+RULES
+- Every number you state about this data must appear exactly in LIVE DATA above. Never invent,
+  estimate, or compute new numbers (no differences, ratios, or averages of your own - quote the
+  two numbers instead). Write numbers exactly as shown, large ones in full with commas (no "K"/"M").
+- The Label (Use / Avoid / Unproven) in the table is final. Never relabel an attribute. Do not state
+  the p-value number itself; use it only internally to judge confidence.
+- You may use general knowledge to explain how to read a chart or why a pattern might exist, but say
+  clearly when you are doing that, and never imply it is something Account E's data shows.
+- If the data above can't answer the question, say so plainly. If the question has nothing to do with
+  this dashboard, say you can only help with it.
+- Style: this box is a narrow sidebar. Be conversational and brief - usually 2 to 4 short sentences,
+  plain paragraphs, no headings or tables. Go longer only if the user asks for a full brief or a
+  detailed walkthrough.
+- End EVERY reply with one final line in exactly this form, naming the tab(s) your answer draws on
+  (choose from: Compare, Correlate, Rank, Locate / Overview, Phase 2, Creative Brief, Overview):
+  [[tabs: Compare]]"""
+
+
+def validate_against_context(response_text, context_text):
+    allowed = []
+    for tok in re.findall(r"\d[\d,]*\.?\d*", context_text):
+        try:
+            allowed.append(float(tok.replace(",", "").rstrip(".")))
+        except ValueError:
+            pass
+    return _flag_numbers(response_text, allowed)
+
+
+_TABS_MARKER = re.compile(r"\[\[\s*tabs?\s*:\s*(.*?)\]\]", re.I | re.S)
+
+
+def split_tabs_marker(text):
+    """Pulls the trailing [[tabs: ...]] marker off a reply -> (clean_text, tabs or None)."""
+    m = _TABS_MARKER.search(text)
+    if not m:
+        return re.sub(r"\[\[.*$", "", text, flags=re.S).strip(), None
+    return (text[:m.start()] + text[m.end():]).strip(), m.group(1).strip()
 
 
 st.set_page_config(page_title="Account E - Super Bowl Ad Strategy", page_icon="🏈", layout="wide")
@@ -223,6 +415,17 @@ st.markdown(
     }
     [data-testid="stSlider"] [data-baseweb="slider"] > div {
         background-color: #ffffff !important;
+    }
+    /* Homepage assistant in the sidebar: white chat cards with dark text on the red pane */
+    [data-testid="stSidebar"] [data-testid="stChatMessage"] {
+        background: #ffffff; border-radius: 10px; padding: 8px 10px;
+    }
+    [data-testid="stSidebar"] [data-testid="stChatMessage"] * { color: #1f1f1f !important; }
+    [data-testid="stSidebar"] [data-testid="stChatMessage"] p { font-size: 0.85rem; }
+    [data-testid="stSidebar"] [data-testid="stChatInput"] { background: #ffffff; border-radius: 10px; }
+    [data-testid="stSidebar"] [data-testid="stChatInput"] textarea { color: #1f1f1f !important; }
+    [data-testid="stSidebar"] .stButton button {
+        background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.45);
     }
     </style>
     """,
@@ -310,6 +513,99 @@ if req_wiki:
     mask &= df["has_wiki_attention"] == True
 
 fdf = df[mask].copy()
+
+# ---------------------------------------------------------------------------
+# Homepage assistant: "Ask the Dashboard" (sidebar, answers about every page)
+# ---------------------------------------------------------------------------
+_HOME_SUGGESTIONS = ["Explain the dumbbell chart", "What should we avoid?", "What is Phase 2 about?"]
+
+
+def _ask_home(question):
+    st.session_state["home_pending"] = question
+
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 💬 Ask the Dashboard")
+    st.caption("Ask about any page. Answers use only this dashboard's numbers for your current filters.")
+
+    if not _GENAI_AVAILABLE:
+        st.warning("The Gemini SDK isn't installed here. Run `pip install google-genai python-dotenv`.")
+    elif not GEMINI_API_KEY:
+        st.warning("No GEMINI_API_KEY found, so the chat is switched off.")
+    else:
+        if "home_messages" not in st.session_state:
+            st.session_state.home_messages = []
+
+        for _i, _q in enumerate(_HOME_SUGGESTIONS):
+            st.button(_q, key=f"home_sugg_{_i}", on_click=_ask_home, args=(_q,), width="stretch")
+
+        _home_box = st.container()
+        _home_prompt = st.chat_input("Ask anything about this dashboard...", key="home_chat_input")
+        if not _home_prompt:
+            _home_prompt = st.session_state.pop("home_pending", None)
+
+        with _home_box:
+            for _m in st.session_state.home_messages:
+                with st.chat_message(_m["role"]):
+                    st.markdown(_m["content"])
+                    if _m.get("flag"):
+                        st.caption(_m["flag"])
+
+            if _home_prompt:
+                st.session_state.home_messages.append({"role": "user", "content": _home_prompt})
+                with st.chat_message("user"):
+                    st.markdown(_home_prompt)
+
+                _active_attrs = [ATTR_LABELS[a] for a, on in attr_filter.items() if on]
+                _active_sources = [lbl for lbl, on in (("YouTube stats", req_youtube),
+                                                       ("an Ad Meter score", req_admeter),
+                                                       ("Wikipedia attention data", req_wiki)) if on]
+                _ctx = build_page_context(fdf, df, compute_attribute_stats(fdf), year_range,
+                                          brand_pick, _active_attrs, _active_sources)
+
+                _contents = [
+                    types.Content(
+                        role="model" if _m["role"] == "assistant" else "user",
+                        parts=[types.Part.from_text(text=_m["content"])],
+                    )
+                    for _m in st.session_state.home_messages[-12:]
+                ]
+
+                with st.chat_message("assistant"):
+                    _ph = st.empty()
+                    _raw = ""
+                    _failed = False
+                    try:
+                        _client = genai.Client(api_key=GEMINI_API_KEY)
+                        for _chunk in _client.models.generate_content_stream(
+                            model=GEMINI_MODEL,
+                            contents=_contents,
+                            config=types.GenerateContentConfig(system_instruction=build_home_instruction(_ctx)),
+                        ):
+                            _raw += _chunk.text or ""
+                            _ph.markdown(split_tabs_marker(_raw)[0])
+                    except Exception as _e:
+                        _failed = True
+                        _raw = f"Sorry, the request to Gemini failed: {_e}"
+
+                    _clean, _tabs = split_tabs_marker(_raw)
+                    _ph.markdown(_clean)
+                    _flag = None
+                    if not _failed:
+                        _bad = validate_against_context(_clean, _ctx)
+                        _where = f"📍 {_tabs}  " if _tabs else ""
+                        if _bad:
+                            _flag = f"{_where}⚠️ Not found in dashboard data: {', '.join(_bad[:6])} - verify."
+                        else:
+                            _flag = f"{_where}✅ numbers verified"
+                        st.caption(_flag)
+
+                st.session_state.home_messages.append({"role": "assistant", "content": _clean, "flag": _flag})
+
+        if st.session_state.home_messages and st.button("Clear chat", key="home_clear"):
+            st.session_state.home_messages = []
+            st.rerun()
 
 # ---------------------------------------------------------------------------
 # KPI row
