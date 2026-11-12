@@ -256,10 +256,12 @@ history). The four Key Metrics cards count ads in the current view and how many 
 YouTube stats, an Ad Meter score, and Wikipedia attention data.
 
 COMPARE tab: "Does a creative attribute change live-audience approval?" A dumbbell chart:
-two dots joined by a line. One dot is the average Ad Meter approval of ads WITH the chosen
-attribute, the other is ads WITHOUT it; the line between them is the gap, so a longer line
-means a bigger effect. The user picks the attribute from a dropdown. Below the chart it
-shows how many ads are in each group and a Mann-Whitney significance check. A dumbbell was
+one row per creative attribute, each with two dots joined by a line. The blue dot is the average
+Ad Meter approval of ads WITH the attribute, the orange dot is ads WITHOUT it; the line between
+them is the gap, so a longer line means a bigger effect. Rows are sorted with the biggest boost
+at the top and the biggest drop at the bottom, and each row is tagged Use / Avoid / Unproven.
+Hovering a dot shows its average and number of ads. A dropdown below the chart shows the full
+numbers for one attribute, including a Mann-Whitney significance check. A dumbbell was
 chosen over single bars and box plots because it puts the gap itself on the page.
 
 CORRELATE tab: "Does a well-liked ad travel further online?" A scatter plot, one dot per ad:
@@ -671,12 +673,59 @@ tab_compare, tab_correlate, tab_rank, tab_locate, tab_phase2, tab_ai = st.tabs(
 with tab_compare:
     st.subheader("Does a creative attribute change live-audience approval?")
     st.caption(
-        "Task: COMPARE. Marks: points + connecting line (a dumbbell). "
+        "Task: COMPARE. Marks: points + connecting line (a dumbbell), one row per attribute. "
         "Channels: position/length (mean approval) x color (with / without)."
     )
 
+    # One row per attribute: orange dot = ads WITHOUT it, blue dot = ads WITH it, the line is the gap.
+    cmp_rows = [
+        r for r in compute_attribute_stats(fdf)
+        if r["n_with"] >= 3 and r["n_without"] >= 3
+        and r["approval_with_pct"] is not None and r["approval_without_pct"] is not None
+    ]
+    if not cmp_rows:
+        st.info("Not enough Ad Meter-scored ads under this filter to compare reliably.")
+    else:
+        # biggest boost at the top, biggest drop at the bottom
+        cmp_rows.sort(key=lambda r: r["approval_with_pct"] - r["approval_without_pct"], reverse=True)
+        ylabels = [f"{r['attribute']}  ·  {r['label']}" for r in cmp_rows]
+        fig = go.Figure()
+        for r, yl in zip(cmp_rows, ylabels):
+            fig.add_trace(go.Scatter(
+                x=[r["approval_without_pct"], r["approval_with_pct"]], y=[yl, yl],
+                mode="lines", line=dict(color=GRID, width=4), showlegend=False, hoverinfo="skip",
+            ))
+        fig.add_trace(go.Scatter(
+            x=[r["approval_without_pct"] for r in cmp_rows], y=ylabels, mode="markers",
+            marker=dict(color=ORANGE, size=15), name="Without the attribute",
+            customdata=[[r["n_without"]] for r in cmp_rows],
+            hovertemplate="<b>%{y}</b><br>Without: %{x:.1f}% avg approval (n=%{customdata[0]})<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=[r["approval_with_pct"] for r in cmp_rows], y=ylabels, mode="markers",
+            marker=dict(color=BLUE, size=15), name="With the attribute",
+            customdata=[[r["n_with"]] for r in cmp_rows],
+            hovertemplate="<b>%{y}</b><br>With: %{x:.1f}% avg approval (n=%{customdata[0]})<extra></extra>",
+        ))
+        lo = min(min(r["approval_with_pct"], r["approval_without_pct"]) for r in cmp_rows)
+        hi = max(max(r["approval_with_pct"], r["approval_without_pct"]) for r in cmp_rows)
+        fig.update_layout(
+            yaxis=dict(categoryorder="array", categoryarray=ylabels[::-1], gridcolor=GRID, automargin=True),
+            xaxis=dict(title="Mean Ad Meter approval percentile (%)", ticksuffix="%",
+                       range=[max(0, lo - 5), min(100, hi + 5)], gridcolor=GRID),
+            plot_bgcolor=SURFACE, paper_bgcolor=SURFACE,
+            height=120 + 52 * len(cmp_rows), margin=dict(t=20, b=40),
+            legend=dict(orientation="h", y=1.08),
+        )
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "Each row is one creative attribute; the tag after the name is its verdict "
+            "(Use / Avoid / Unproven). Hover a dot for the average and the number of ads behind it."
+        )
+
     attr_choice = st.selectbox(
-        "Pick an attribute", ATTRS, format_func=lambda a: ATTR_LABELS[a], key="compare_attr"
+        "See the full numbers for one attribute", ATTRS,
+        format_func=lambda a: ATTR_LABELS[a], key="compare_attr",
     )
 
     am = fdf[fdf["has_admeter"] == True]
@@ -687,28 +736,6 @@ with tab_compare:
         st.info("Not enough Ad Meter-scored ads with this attribute (and this filter) to compare reliably.")
     else:
         u_stat, p_val = stats.mannwhitneyu(with_grp, without_grp, alternative="two-sided")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=[without_grp.mean(), with_grp.mean()], y=[0, 0],
-            mode="lines", line=dict(color=GRID, width=3), showlegend=False,
-        ))
-        fig.add_trace(go.Scatter(
-            x=[without_grp.mean()], y=[0], mode="markers",
-            marker=dict(color=ORANGE, size=18), name=f"Without {ATTR_LABELS[attr_choice]}",
-        ))
-        fig.add_trace(go.Scatter(
-            x=[with_grp.mean()], y=[0], mode="markers",
-            marker=dict(color=BLUE, size=18), name=f"With {ATTR_LABELS[attr_choice]}",
-        ))
-        fig.update_layout(
-            yaxis=dict(visible=False, range=[-1, 1]),
-            xaxis=dict(title="Mean Ad Meter approval percentile", tickformat=".0%", gridcolor=GRID),
-            plot_bgcolor=SURFACE, paper_bgcolor=SURFACE,
-            height=260, margin=dict(t=20, b=40),
-            legend=dict(orientation="h", y=1.2),
-        )
-        st.plotly_chart(fig, width='stretch')
-
         sig = "statistically significant (p < 0.05)" if p_val < 0.05 else "not statistically significant"
         st.caption(
             f"With: {with_grp.mean():.1%} avg approval (n={len(with_grp)}) &nbsp;|&nbsp; "
