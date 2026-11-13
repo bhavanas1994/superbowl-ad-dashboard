@@ -14,6 +14,7 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
+import altair as alt
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy import stats
@@ -260,21 +261,27 @@ one row per creative attribute, each with two dots joined by a line. The blue do
 Ad Meter approval of ads WITH the attribute, the orange dot is ads WITHOUT it; the line between
 them is the gap, so a longer line means a bigger effect. Rows are sorted with the biggest boost
 at the top and the biggest drop at the bottom, and each row is tagged Use / Avoid / Unproven.
-Hovering a dot shows its average and number of ads. A dropdown below the chart shows the full
-numbers for one attribute, including a Mann-Whitney significance check. A dumbbell was
+Hovering a dot shows its average and number of ads. Clicking a row highlights that attribute (the
+others fade) and shows its verdict, with/without averages, number of ads and a significance check
+below the chart. A dumbbell was
 chosen over single bars and box plots because it puts the gap itself on the page.
 
 CORRELATE tab: "Does a well-liked ad travel further online?" A scatter plot, one dot per ad:
 x = approval percentile, y = YouTube views (log scale, because views span hundreds to
 hundreds of millions). Spearman rho summarises it: near 0 means approval and views are not
-related, toward +1 means better-liked ads also get more views.
+related, toward +1 means better-liked ads also get more views. The user can drag a box on the
+scatter to select a group of ads; the selected dots stay blue, the rest turn gray, and below it
+update the count of selected ads, their average approval and median YouTube views, a bar chart of
+which creative attributes those ads have, and a table of the selected ads (double-click clears).
 
 RANK tab: "Which ads got the biggest online attention spike?" Horizontal bars of the ads with
 the largest Wikipedia pageview spikes (a spike of 10 means 10x normal pageviews), sorted so the
-biggest are on top. A slider picks how many ads to show (5 to 20).
+biggest are on top. A slider picks how many ads to show (5 to 20). Clicking a bar highlights that
+ad and shows its name and spike size below the chart.
 
 LOCATE / OVERVIEW tab: "Which years does each data source cover?" Grouped bars per year: how
 many ads have YouTube, Ad Meter, and Wikipedia data. Its point is to make coverage gaps visible.
+Clicking a data source in the legend highlights just that source and fades the others.
 
 PHASE 2 - ATTRIBUTE COMBO EXPLORER tab: the user builds a concept by picking several creative
 attributes; it finds past ads with exactly that combination and shows how many match, their
@@ -675,7 +682,6 @@ with tab_compare:
         "Channels: position/length (mean approval) x color (with / without)."
     )
 
-    # One row per attribute: orange dot = ads WITHOUT it, blue dot = ads WITH it, the line is the gap.
     cmp_rows = [
         r for r in compute_attribute_stats(fdf)
         if r["n_with"] >= 3 and r["n_without"] >= 3
@@ -684,62 +690,40 @@ with tab_compare:
     if not cmp_rows:
         st.info("Not enough Ad Meter-scored ads under this filter to compare reliably.")
     else:
-        # biggest boost at the top, biggest drop at the bottom
         cmp_rows.sort(key=lambda r: r["approval_with_pct"] - r["approval_without_pct"], reverse=True)
-        ylabels = [f"{r['attribute']}  ·  {r['label']}" for r in cmp_rows]
-        fig = go.Figure()
-        for r, yl in zip(cmp_rows, ylabels):
-            fig.add_trace(go.Scatter(
-                x=[r["approval_without_pct"], r["approval_with_pct"]], y=[yl, yl],
-                mode="lines", line=dict(color=GRID, width=4), showlegend=False, hoverinfo="skip",
-            ))
-        fig.add_trace(go.Scatter(
-            x=[r["approval_without_pct"] for r in cmp_rows], y=ylabels, mode="markers",
-            marker=dict(color=ORANGE, size=15), name="Without the attribute",
-            customdata=[[r["n_without"]] for r in cmp_rows],
-            hovertemplate="<b>%{y}</b><br>Without: %{x:.1f}% avg approval (n=%{customdata[0]})<extra></extra>",
-        ))
-        fig.add_trace(go.Scatter(
-            x=[r["approval_with_pct"] for r in cmp_rows], y=ylabels, mode="markers",
-            marker=dict(color=BLUE, size=15), name="With the attribute",
-            customdata=[[r["n_with"]] for r in cmp_rows],
-            hovertemplate="<b>%{y}</b><br>With: %{x:.1f}% avg approval (n=%{customdata[0]})<extra></extra>",
-        ))
-        lo = min(min(r["approval_with_pct"], r["approval_without_pct"]) for r in cmp_rows)
-        hi = max(max(r["approval_with_pct"], r["approval_without_pct"]) for r in cmp_rows)
-        fig.update_layout(
-            yaxis=dict(categoryorder="array", categoryarray=ylabels[::-1], gridcolor=GRID, automargin=True),
-            xaxis=dict(title="Mean Ad Meter approval percentile (%)", ticksuffix="%",
-                       range=[max(0, lo - 5), min(100, hi + 5)], gridcolor=GRID),
-            plot_bgcolor=SURFACE, paper_bgcolor=SURFACE,
-            height=120 + 52 * len(cmp_rows), margin=dict(t=20, b=40),
-            legend=dict(orientation="h", y=1.08),
-        )
-        st.plotly_chart(fig, width='stretch')
-        st.caption(
-            "Each row is one creative attribute; the tag after the name is its verdict "
-            "(Use / Avoid / Unproven). Hover a dot for the average and the number of ads behind it."
-        )
-
-    attr_choice = st.selectbox(
-        "See the full numbers for one attribute", ATTRS,
-        format_func=lambda a: ATTR_LABELS[a], key="compare_attr",
-    )
-
-    am = fdf[fdf["has_admeter"] == True]
-    with_grp = am[am[attr_choice] == True]["ad_meter_percentile"].dropna()
-    without_grp = am[am[attr_choice] == False]["ad_meter_percentile"].dropna()
-
-    if len(with_grp) < 3 or len(without_grp) < 3:
-        st.info("Not enough Ad Meter-scored ads with this attribute (and this filter) to compare reliably.")
-    else:
-        u_stat, p_val = stats.mannwhitneyu(with_grp, without_grp, alternative="two-sided")
-        sig = "statistically significant (p < 0.05)" if p_val < 0.05 else "not statistically significant"
-        st.caption(
-            f"With: {with_grp.mean():.1%} avg approval (n={len(with_grp)}) &nbsp;|&nbsp; "
-            f"Without: {without_grp.mean():.1%} avg approval (n={len(without_grp)}) &nbsp;|&nbsp; "
-            f"Mann-Whitney p = {p_val:.3f} ({sig})"
-        )
+        cdf = pd.DataFrame([{
+            "label": f"{r['attribute']}  ·  {r['label']}", "attribute": r["attribute"], "verdict": r["label"],
+            "without": r["approval_without_pct"], "with": r["approval_with_pct"],
+            "n_without": r["n_without"], "n_with": r["n_with"], "p": r["p_value"],
+        } for r in cmp_rows])
+        lo = min(cdf["with"].min(), cdf["without"].min()); hi = max(cdf["with"].max(), cdf["without"].max())
+        st.caption("Click a row to highlight that attribute and see its numbers. Click empty space to clear.")
+        pick = alt.selection_point(name="pick", fields=["label"])
+        yenc = alt.Y("label:N", sort=list(cdf["label"]), title=None, axis=alt.Axis(labelLimit=280))
+        xscale = alt.Scale(domain=[max(0, lo - 5), min(100, hi + 5)])
+        rule = alt.Chart(cdf).mark_rule(strokeWidth=5, color=GRID).encode(
+            y=yenc, x=alt.X("without:Q", scale=xscale, title="Mean Ad Meter approval percentile (%)"), x2="with:Q",
+            opacity=alt.condition(pick, alt.value(1), alt.value(0.35)))
+        dots = alt.Chart(cdf).transform_fold(["without", "with"], as_=["which", "value"]).mark_circle(size=230).encode(
+            y=yenc, x=alt.X("value:Q", scale=xscale),
+            color=alt.Color("which:N", scale=alt.Scale(domain=["without", "with"], range=[ORANGE, BLUE]),
+                            legend=alt.Legend(title=None, orient="top", labelExpr="datum.label == 'with' ? 'With the attribute' : 'Without the attribute'")),
+            opacity=alt.condition(pick, alt.value(1), alt.value(0.3)),
+            tooltip=[alt.Tooltip("label:N", title="Attribute"),
+                     alt.Tooltip("without:Q", title="Without (avg %)", format=".1f"), alt.Tooltip("n_without:Q", title="n without"),
+                     alt.Tooltip("with:Q", title="With (avg %)", format=".1f"), alt.Tooltip("n_with:Q", title="n with")])
+        chart = alt.layer(rule, dots).add_params(pick).properties(height=60 + 48 * len(cdf))
+        ev = st.altair_chart(chart, width="stretch", on_select="rerun", key="cmp_pick")
+        chosen_rows = ((ev.get("selection") or {}).get("pick")) or []
+        hit_rows = cdf[cdf["label"] == chosen_rows[0]["label"]] if chosen_rows else cdf.iloc[0:0]
+        if len(hit_rows):
+            row = hit_rows.iloc[0]
+            d1, d2, d3 = st.columns(3)
+            d1.metric(f"{row['attribute']} - verdict", row["verdict"])
+            d2.metric(f"With ({int(row['n_with'])} ads)", f"{row['with']:.1f}%")
+            d3.metric(f"Without ({int(row['n_without'])} ads)", f"{row['without']:.1f}%")
+            sig = "statistically significant (p < 0.05)" if row["p"] < 0.05 else "not statistically significant"
+            st.caption(f"Mann-Whitney p = {row['p']:.3f} ({sig})")
 
     with st.expander("Why a dumbbell chart, and what we rejected"):
         st.markdown(
@@ -771,18 +755,59 @@ with tab_correlate:
         st.info("Not enough ads with both an Ad Meter score and YouTube views under this filter.")
     else:
         rho, p_val = stats.spearmanr(both["ad_meter_percentile"], both["view_count"])
-        fig = px.scatter(
-            both, x="ad_meter_percentile", y="view_count",
-            hover_data=["brand", "year"],
-            labels={"ad_meter_percentile": "Ad Meter approval percentile", "view_count": "YouTube views"},
-            color_discrete_sequence=[BLUE],
+        st.caption("Drag a box on the scatter to select ads - the charts and table below update. Double-click to clear.")
+        pts = both[["brand", "year", "ad_meter_percentile", "view_count"]].copy()
+        brush = alt.selection_interval(name="brush", encodings=["x", "y"])
+        scatter = (
+            alt.Chart(pts).mark_circle(size=85, opacity=0.85)
+            .encode(
+                x=alt.X("ad_meter_percentile:Q", title="Ad Meter approval percentile",
+                        axis=alt.Axis(format="%"), scale=alt.Scale(zero=False)),
+                y=alt.Y("view_count:Q", title="YouTube views", scale=alt.Scale(type="log"),
+                        axis=alt.Axis(tickCount=6, gridOpacity=0.5, format="~s")),
+                color=alt.condition(brush, alt.value(BLUE), alt.value("#d4d3cd")),
+                tooltip=[
+                    alt.Tooltip("brand:N", title="Brand"), alt.Tooltip("year:O", title="Year"),
+                    alt.Tooltip("ad_meter_percentile:Q", title="Approval", format=".0%"),
+                    alt.Tooltip("view_count:Q", title="YouTube views", format=","),
+                ],
+            )
+            .add_params(brush).properties(height=380)
         )
-        fig.update_yaxes(type="log", gridcolor=GRID)
-        fig.update_xaxes(tickformat=".0%", gridcolor=GRID)
-        fig.update_traces(marker=dict(size=9, opacity=0.75, line=dict(width=0.5, color="white")))
-        fig.update_layout(plot_bgcolor=SURFACE, paper_bgcolor=SURFACE, height=440)
-        st.plotly_chart(fig, width='stretch')
+        event = st.altair_chart(scatter, width="stretch", on_select="rerun", key="corr_brush")
         st.caption(f"Spearman rho = {rho:.2f}, p = {p_val:.3f}, n = {len(both)}")
+
+        sel = (event.get("selection") or {}).get("brush") or {}
+        chosen = both
+        if "ad_meter_percentile" in sel and "view_count" in sel:
+            x0, x1 = sorted(sel["ad_meter_percentile"])
+            y0, y1 = sorted(sel["view_count"])
+            chosen = both[both["ad_meter_percentile"].between(x0, x1) & both["view_count"].between(y0, y1)]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Ads in selection", f"{len(chosen)} of {len(both)}")
+        m2.metric("Avg approval percentile", f"{chosen['ad_meter_percentile'].mean():.0%}" if len(chosen) else "n/a")
+        m3.metric("Median YouTube views", f"{chosen['view_count'].median():,.0f}" if len(chosen) else "n/a")
+
+        left, right = st.columns([2, 3])
+        with left:
+            st.markdown("**Which attributes do the selected ads have?**")
+            counts = pd.DataFrame({
+                "attribute": [ATTR_LABELS[a] for a in ATTRS],
+                "ads": [int((chosen[a] == True).sum()) for a in ATTRS],
+            })
+            bar = (
+                alt.Chart(counts).mark_bar(color=AQUA)
+                .encode(x=alt.X("ads:Q", title="Ads in selection"),
+                        y=alt.Y("attribute:N", sort="-x", title=None, axis=alt.Axis(labelLimit=220)))
+                .properties(height=250)
+            )
+            st.altair_chart(bar, width="stretch")
+        with right:
+            st.markdown("**Selected ads**")
+            tbl = chosen[["year", "brand", "ad_meter_percentile", "view_count"]].sort_values(
+                "view_count", ascending=False).head(50)
+            st.dataframe(tbl, hide_index=True, width="stretch", height=290)
 
     with st.expander("Why a scatter plot, and what we rejected"):
         st.markdown(
@@ -817,14 +842,27 @@ with tab_rank:
     if len(top) == 0:
         st.info("No ads with Wikipedia attention data under this filter.")
     else:
-        fig = px.bar(
-            top, x="wiki_attention_spike", y="label", orientation="h",
-            labels={"wiki_attention_spike": "Attention spike (x normal)", "label": ""},
-            color_discrete_sequence=[AQUA],
+        st.caption("Click a bar to highlight it and see its details. Click empty space to clear.")
+        rpick = alt.selection_point(name="rpick", fields=["label"])
+        rchart = (
+            alt.Chart(top).mark_bar()
+            .encode(
+                x=alt.X("wiki_attention_spike:Q", title="Attention spike (x normal)"),
+                y=alt.Y("label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=300)),
+                color=alt.condition(rpick, alt.value(AQUA), alt.value("#bfe6d8")),
+                tooltip=[alt.Tooltip("label:N", title="Ad"),
+                         alt.Tooltip("wiki_attention_spike:Q", title="Spike (x normal)", format=".2f")],
+            )
+            .add_params(rpick).properties(height=max(300, 30 * len(top)))
         )
-        fig.update_layout(plot_bgcolor=SURFACE, paper_bgcolor=SURFACE, height=max(300, 28 * len(top)))
-        fig.update_xaxes(gridcolor=GRID)
-        st.plotly_chart(fig, width='stretch')
+        rev = st.altair_chart(rchart, width="stretch", on_select="rerun", key="rank_pick")
+        rsel = ((rev.get("selection") or {}).get("rpick")) or []
+        rhit = top[top["label"] == rsel[0]["label"]] if rsel else top.iloc[0:0]
+        if len(rhit):
+            hit = rhit.iloc[0]
+            r1, r2 = st.columns(2)
+            r1.metric("Selected ad", hit["label"])
+            r2.metric("Wikipedia attention spike", f"{float(hit['wiki_attention_spike']):.2f}x normal")
 
     with st.expander("Why a horizontal bar chart, and what we rejected"):
         st.markdown(
@@ -857,15 +895,24 @@ with tab_locate:
             rows.append({"year": y, "source": lbl, "count": int(fdf[(fdf["year"] == y) & (fdf[s] == True)].shape[0])})
     cov = pd.DataFrame(rows)
 
-    fig = px.bar(
-        cov, x="year", y="count", color="source", barmode="group",
-        color_discrete_map={"YouTube metrics": BLUE, "Ad Meter score": ORANGE, "Wikipedia attention": AQUA},
-        labels={"count": "Number of ads with this data", "year": "Year"},
+    st.caption("Click a data source in the legend to highlight it. Click it again to clear.")
+    lsel = alt.selection_point(fields=["source"], bind="legend")
+    lchart = (
+        alt.Chart(cov).mark_bar()
+        .encode(
+            x=alt.X("year:O", title="Year"), xOffset="source:N",
+            y=alt.Y("count:Q", title="Number of ads with this data"),
+            color=alt.Color("source:N", title=None,
+                            scale=alt.Scale(domain=["YouTube metrics", "Ad Meter score", "Wikipedia attention"],
+                                            range=[BLUE, ORANGE, AQUA]),
+                            legend=alt.Legend(orient="top")),
+            opacity=alt.condition(lsel, alt.value(1), alt.value(0.12)),
+            tooltip=[alt.Tooltip("year:O", title="Year"), alt.Tooltip("source:N", title="Source"),
+                     alt.Tooltip("count:Q", title="Ads")],
+        )
+        .add_params(lsel).properties(height=420)
     )
-    fig.update_layout(plot_bgcolor=SURFACE, paper_bgcolor=SURFACE, height=440, legend_title_text="")
-    fig.update_xaxes(type="category", gridcolor=GRID)
-    fig.update_yaxes(gridcolor=GRID)
-    st.plotly_chart(fig, width='stretch')
+    st.altair_chart(lchart, width="stretch")
 
     with st.expander("Why a grouped bar chart, and what we rejected"):
         st.markdown(
