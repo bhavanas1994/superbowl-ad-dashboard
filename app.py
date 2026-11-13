@@ -872,7 +872,8 @@ with tab_rank:
             hit = rhit.iloc[0]
             with rank_detail:
                 r1, r2 = st.columns([3, 2])
-                r1.metric("Selected ad", hit["label"])
+                r1.markdown(f"<div style='font-size:0.85rem;opacity:.7'>Selected ad</div>"
+                            f"<div style='font-size:1.6rem;line-height:1.3'>{hit['label']}</div>", unsafe_allow_html=True)
                 r2.metric("Wikipedia attention spike", f"{float(hit['wiki_attention_spike']):.2f}x normal")
 
     with st.expander("Why a horizontal bar chart, and what we rejected"):
@@ -906,8 +907,9 @@ with tab_locate:
             rows.append({"year": y, "source": lbl, "count": int(fdf[(fdf["year"] == y) & (fdf[s] == True)].shape[0])})
     cov = pd.DataFrame(rows)
 
-    st.caption("Click a data source in the legend to highlight it. Click it again to clear.")
-    lsel = alt.selection_point(fields=["source"], bind="legend")
+    st.caption("Click any bar to highlight that data source across all years and see its coverage. Click empty space to clear.")
+    loc_detail = st.container()
+    lsel = alt.selection_point(name="lsel", fields=["source"])
     lchart = (
         alt.Chart(cov).mark_bar()
         .encode(
@@ -923,7 +925,18 @@ with tab_locate:
         )
         .add_params(lsel).properties(height=420)
     )
-    st.altair_chart(lchart, width="stretch")
+    lev = st.altair_chart(lchart, width="stretch", on_select="rerun", key="loc_pick")
+    lchosen = ((lev.get("selection") or {}).get("lsel")) or []
+    if lchosen:
+        src_df = cov[cov["source"] == lchosen[0]["source"]]
+        have = src_df[src_df["count"] > 0]
+        if len(have):
+            peak = have.loc[have["count"].idxmax()]
+            with loc_detail:
+                l1, l2, l3 = st.columns(3)
+                l1.metric(f"{lchosen[0]['source']} - years covered", f"{int(have['year'].min())}-{int(have['year'].max())}")
+                l2.metric("Ads with this data", f"{int(have['count'].sum())}")
+                l3.metric("Peak year", f"{int(peak['year'])} ({int(peak['count'])} ads)")
 
     with st.expander("Why a grouped bar chart, and what we rejected"):
         st.markdown(
