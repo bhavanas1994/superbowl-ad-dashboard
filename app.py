@@ -281,9 +281,6 @@ attributes; it finds past ads with exactly that combination and shows how many m
 average approval and average YouTube views versus the overall averages, and lists the matching
 ads. Few matches means the result is only a directional signal.
 
-CREATIVE BRIEF ASSISTANT tab: a chat that writes short, evidence-backed creative briefs for next
-year's pitch, using the Use / Avoid / Unproven labels.
-
 LABELS: Use = approval is significantly higher with the attribute; Avoid = significantly lower;
 Unproven = not enough evidence (too few ads, or the difference could be chance). The label is
 computed by code and must never be changed.
@@ -309,7 +306,7 @@ def build_page_context(fdf, df, stats_rows, year_range, brand_pick, active_attrs
     )
 
     # Compare (and Creative Brief)
-    out += ["", "COMPARE / CREATIVE BRIEF - approval with vs. without each attribute:",
+    out += ["", "COMPARE (also the basis for creative briefs) - approval with vs. without each attribute:",
             "| Attribute | n(with) | n(without) | Approval w/ | Approval w/o | p-value | Label | Avg YouTube views (w/) | Avg Wiki spike (w/) |",
             "|---|---|---|---|---|---|---|---|---|"]
     for r in stats_rows:
@@ -379,9 +376,10 @@ def build_page_context(fdf, df, stats_rows, year_range, brand_pick, active_attrs
 
 def build_home_instruction(context_text):
     return f"""You are the dashboard guide for Account E's Super Bowl ad strategy dashboard. You
-answer questions about ANY page of it: Compare, Correlate, Rank, Locate / Overview, Phase 2, and
-the Creative Brief Assistant - what a chart shows, how to read it, why it was chosen, and what the
-current numbers say.
+answer questions about ANY page of it: Compare, Correlate, Rank, Locate / Overview, and Phase 2 -
+what a chart shows, how to read it, why it was chosen, and what the current numbers say. You also
+write short, evidence-backed creative briefs for next year's pitch when asked, using the
+Use / Avoid / Unproven labels.
 
 {PAGE_GUIDE}
 {context_text}
@@ -400,7 +398,7 @@ RULES
   plain paragraphs, no headings or tables. Go longer only if the user asks for a full brief or a
   detailed walkthrough.
 - End EVERY reply with one final line in exactly this form, naming the tab(s) your answer draws on
-  (choose from: Compare, Correlate, Rank, Locate / Overview, Phase 2, Creative Brief, Overview):
+  (choose from: Compare, Correlate, Rank, Locate / Overview, Phase 2, Overview):
   [[tabs: Compare]]"""
 
 
@@ -662,9 +660,9 @@ if len(fdf) == 0:
     st.warning("No ads match the current filters. Loosen a filter in the sidebar.")
     st.stop()
 
-tab_compare, tab_correlate, tab_rank, tab_locate, tab_phase2, tab_ai = st.tabs(
+tab_compare, tab_correlate, tab_rank, tab_locate, tab_phase2 = st.tabs(
     ["📊 Compare", "📈 Correlate", "🏆 Rank", "🗺️ Locate / Overview",
-     "🧩 Phase 2: Attribute Combo Explorer", "🤖 Creative Brief Assistant"]
+     "🧩 Phase 2: Attribute Combo Explorer"]
 )
 
 # ---------------------------------------------------------------------------
@@ -942,102 +940,6 @@ with tab_phase2:
             "- **What's deferred to Sprint-to-Final:** the AI layer (see below) will turn this from "
             "\"look up similar past ads\" into \"describe your concept in a sentence and get the "
             "closest-matching historical combination suggested automatically.\""
-        )
-
-# ---------------------------------------------------------------------------
-# TAB 6 - CREATIVE BRIEF ASSISTANT (AI Integration: Defined, now built)
-# ---------------------------------------------------------------------------
-with tab_ai:
-    st.subheader("Creative Brief Assistant")
-    st.caption(
-        "Task: GENERATE. Turns the current filtered view into a short, evidence-backed "
-        "creative brief for next year's concept pitch. Every recommendation must cite a "
-        "number from the stats table below - the AI cannot invent its own statistics or "
-        "override the Use / Avoid / Unproven label."
-    )
-
-    if not _GENAI_AVAILABLE:
-        st.warning(
-            "The Gemini SDK isn't installed in this environment. Run "
-            "`pip install google-genai python-dotenv` (or `uv sync` if this project uses uv) "
-            "and restart the app."
-        )
-    elif not GEMINI_API_KEY:
-        st.warning(
-            "No GEMINI_API_KEY found. Add one to a `.env` file in this folder:\n\n"
-            "`GEMINI_API_KEY=your_api_key_here`"
-        )
-    else:
-        stats_rows = compute_attribute_stats(fdf)
-
-        if "brief_messages" not in st.session_state:
-            st.session_state.brief_messages = []
-
-        for msg in st.session_state.brief_messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-                if msg.get("flag"):
-                    st.caption(msg["flag"])
-
-        prompt = st.chat_input(
-            "Ask for a creative brief, e.g. “What should we recommend for next year's pitch?”"
-        )
-        if prompt:
-            st.session_state.brief_messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            system_instruction = build_system_instruction(stats_rows, year_range, brand_pick)
-
-            contents = []
-            for msg in st.session_state.brief_messages:
-                role = "model" if msg["role"] == "assistant" else "user"
-                contents.append(
-                    types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
-                )
-
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                assistant_content = ""
-                try:
-                    for chunk in stream_gemini(client, contents, system_instruction):
-                        assistant_content += chunk.text or ""
-                        placeholder.markdown(assistant_content)
-                except Exception as e:
-                    assistant_content = f"Sorry, the request to Gemini failed: {e}"
-                    placeholder.markdown(assistant_content)
-
-                suspicious = validate_citations(assistant_content, stats_rows)
-                if suspicious:
-                    flag = (
-                        "⚠️ Numbers not found in the stats table: "
-                        + ", ".join(suspicious) + " - verify before using."
-                    )
-                else:
-                    flag = "✅ All cited numbers matched the stats table."
-                st.caption(flag)
-
-            st.session_state.brief_messages.append(
-                {"role": "assistant", "content": assistant_content, "flag": flag}
-            )
-
-        if st.session_state.brief_messages and st.button("Clear conversation"):
-            st.session_state.brief_messages = []
-            st.rerun()
-
-    with st.expander("How this is validated"):
-        st.markdown(
-            "- The **Label** column (Use / Avoid / Unproven) is computed in Python from the "
-            "same Mann-Whitney test used in the Compare tab, *before* the AI ever sees it - "
-            "the model is told which label is allowed and cannot override it.\n"
-            f"- Use or Avoid requires p < {SIG_LEVEL} **and** n ≥ {MIN_GROUP_N} in both "
-            "groups; everything else is labeled Unproven, including low-n attributes like "
-            "Patriotic.\n"
-            "- After each reply, the numbers in the AI's response are checked against the "
-            "stats table; any number that doesn't match is flagged for a human to "
-            "double-check rather than trusted automatically.\n"
-            f"- Model: Gemini (`{GEMINI_MODEL}`) via the Gemini API."
         )
 
 # ---------------------------------------------------------------------------
