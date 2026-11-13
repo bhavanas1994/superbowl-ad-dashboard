@@ -698,9 +698,13 @@ with tab_compare:
         } for r in cmp_rows])
         lo = min(cdf["with"].min(), cdf["without"].min()); hi = max(cdf["with"].max(), cdf["without"].max())
         st.caption("Click a row to highlight that attribute and see its numbers. Click empty space to clear.")
+        cmp_detail = st.container()
         pick = alt.selection_point(name="pick", fields=["label"])
         yenc = alt.Y("label:N", sort=list(cdf["label"]), title=None, axis=alt.Axis(labelLimit=280))
         xscale = alt.Scale(domain=[max(0, lo - 5), min(100, hi + 5)])
+        _x0, _x1 = max(0, lo - 5), min(100, hi + 5)
+        band = alt.Chart(cdf.assign(x0=_x0, x1=_x1)).mark_bar(color="#888888", opacity=0.02, size=44).encode(
+            y=yenc, x=alt.X("x0:Q", scale=xscale), x2="x1:Q")
         rule = alt.Chart(cdf).mark_rule(strokeWidth=5, color=GRID).encode(
             y=yenc, x=alt.X("without:Q", scale=xscale, title="Mean Ad Meter approval percentile (%)"), x2="with:Q",
             opacity=alt.condition(pick, alt.value(1), alt.value(0.35)))
@@ -712,18 +716,19 @@ with tab_compare:
             tooltip=[alt.Tooltip("label:N", title="Attribute"),
                      alt.Tooltip("without:Q", title="Without (avg %)", format=".1f"), alt.Tooltip("n_without:Q", title="n without"),
                      alt.Tooltip("with:Q", title="With (avg %)", format=".1f"), alt.Tooltip("n_with:Q", title="n with")])
-        chart = alt.layer(rule, dots).add_params(pick).properties(height=60 + 48 * len(cdf))
+        chart = alt.layer(band, rule, dots).add_params(pick).properties(height=60 + 48 * len(cdf))
         ev = st.altair_chart(chart, width="stretch", on_select="rerun", key="cmp_pick")
         chosen_rows = ((ev.get("selection") or {}).get("pick")) or []
         hit_rows = cdf[cdf["label"] == chosen_rows[0]["label"]] if chosen_rows else cdf.iloc[0:0]
         if len(hit_rows):
             row = hit_rows.iloc[0]
-            d1, d2, d3 = st.columns(3)
-            d1.metric(f"{row['attribute']} - verdict", row["verdict"])
-            d2.metric(f"With ({int(row['n_with'])} ads)", f"{row['with']:.1f}%")
-            d3.metric(f"Without ({int(row['n_without'])} ads)", f"{row['without']:.1f}%")
-            sig = "statistically significant (p < 0.05)" if row["p"] < 0.05 else "not statistically significant"
-            st.caption(f"Mann-Whitney p = {row['p']:.3f} ({sig})")
+            with cmp_detail:
+                d1, d2, d3 = st.columns(3)
+                d1.metric(f"{row['attribute']} - verdict", row["verdict"])
+                d2.metric(f"With ({int(row['n_with'])} ads)", f"{row['with']:.1f}%")
+                d3.metric(f"Without ({int(row['n_without'])} ads)", f"{row['without']:.1f}%")
+                sig = "statistically significant (p < 0.05)" if row["p"] < 0.05 else "not statistically significant"
+                st.caption(f"Mann-Whitney p = {row['p']:.3f} ({sig})")
 
     with st.expander("Why a dumbbell chart, and what we rejected"):
         st.markdown(
@@ -843,26 +848,32 @@ with tab_rank:
         st.info("No ads with Wikipedia attention data under this filter.")
     else:
         st.caption("Click a bar to highlight it and see its details. Click empty space to clear.")
+        rank_detail = st.container()
         rpick = alt.selection_point(name="rpick", fields=["label"])
-        rchart = (
+        _rmax = float(top["wiki_attention_spike"].max()) * 1.05
+        rscale = alt.Scale(domain=[0, _rmax])
+        rband = alt.Chart(top.assign(x0=0.0, x1=_rmax)).mark_bar(color="#888888", opacity=0.02, size=26).encode(
+            y=alt.Y("label:N", sort=list(top["label"][::-1]), title=None), x=alt.X("x0:Q", scale=rscale), x2="x1:Q")
+        rbars = (
             alt.Chart(top).mark_bar()
             .encode(
-                x=alt.X("wiki_attention_spike:Q", title="Attention spike (x normal)"),
-                y=alt.Y("label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=300)),
+                x=alt.X("wiki_attention_spike:Q", scale=rscale, title="Attention spike (x normal)"),
+                y=alt.Y("label:N", sort=list(top["label"][::-1]), title=None, axis=alt.Axis(labelLimit=300)),
                 color=alt.condition(rpick, alt.value(AQUA), alt.value("#bfe6d8")),
                 tooltip=[alt.Tooltip("label:N", title="Ad"),
                          alt.Tooltip("wiki_attention_spike:Q", title="Spike (x normal)", format=".2f")],
             )
-            .add_params(rpick).properties(height=max(300, 30 * len(top)))
         )
+        rchart = alt.layer(rband, rbars).add_params(rpick).properties(height=max(300, 30 * len(top)))
         rev = st.altair_chart(rchart, width="stretch", on_select="rerun", key="rank_pick")
         rsel = ((rev.get("selection") or {}).get("rpick")) or []
         rhit = top[top["label"] == rsel[0]["label"]] if rsel else top.iloc[0:0]
         if len(rhit):
             hit = rhit.iloc[0]
-            r1, r2 = st.columns(2)
-            r1.metric("Selected ad", hit["label"])
-            r2.metric("Wikipedia attention spike", f"{float(hit['wiki_attention_spike']):.2f}x normal")
+            with rank_detail:
+                r1, r2 = st.columns([3, 2])
+                r1.metric("Selected ad", hit["label"])
+                r2.metric("Wikipedia attention spike", f"{float(hit['wiki_attention_spike']):.2f}x normal")
 
     with st.expander("Why a horizontal bar chart, and what we rejected"):
         st.markdown(
